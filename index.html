@@ -932,36 +932,32 @@ async function processFits(entry, referenceEntry, settings, onProgress) {
 
   if (!window._pyodideReady) {
     if (!window._pyodideLoading) {
-      window._pyodideLoading = loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/' })
-        .then(py => {
-          window.pyodide = py;
-          window._pyodideReady = true;
-        });
+      window._pyodideLoading = (async () => {
+        const py = await loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/' });
+        window.pyodide = py;
+
+        onProgress(10, 'Installing numpy, scipy, astropy...');
+        await py.loadPackage(['numpy', 'scipy', 'astropy', 'micropip']);
+
+        onProgress(25, 'Installing reproject (first run only, ~30s)...');
+        await py.runPythonAsync(`
+import micropip
+await micropip.install('reproject', keep_going=True)
+`);
+        window._pyodideReady = true;
+      })();
     }
     await window._pyodideLoading;
   }
 
-  onProgress(5, 'Reading file data...');
+  onProgress(35, 'Reading file data...');
 
-  const inputBuf = await entry.file.arrayBuffer();
-  const refBuf = await (referenceEntry || entry).file.arrayBuffer();
+  // Read both files fresh each call — arrayBuffer() can only be read once per File object
+  const inputBuf  = await entry.file.slice(0).arrayBuffer();
+  const refFile   = (referenceEntry || entry).file;
+  const refBuf    = await refFile.slice(0).arrayBuffer();
 
-  onProgress(10, 'Installing dependencies (first run may take ~60s)...');
-
-  await window.pyodide.loadPackage(['numpy', 'scipy', 'astropy']);
-
-  onProgress(30, 'Loading reproject...');
-
-  try {
-    await window.pyodide.loadPackage('reproject');
-  } catch(e) {
-    await window.pyodide.runPythonAsync(`
-import micropip
-await micropip.install('reproject')
-`);
-  }
-
-  onProgress(45, 'Reprojecting...');
+  onProgress(45, 'Reprojecting — this may take a minute for large files...');
 
   window.pyodide.globals.set('input_bytes', new Uint8Array(inputBuf));
   window.pyodide.globals.set('ref_bytes', new Uint8Array(refBuf));
@@ -1256,11 +1252,23 @@ async function runProcessing() {
   document.getElementById('downloadItems').innerHTML = '';
   state.outputs = [];
 
+  // Load Pyodide JS first, synchronously, before anything else runs
   if (!window.loadPyodide) {
-    const script = document.createElement('script');
-    script.src = 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js';
-    document.head.appendChild(script);
-    await new Promise(resolve => script.onload = resolve);
+    const loadingMsg = document.createElement('div');
+    loadingMsg.id = 'pyodide-load-msg';
+    loadingMsg.className = 'progress-item';
+    loadingMsg.innerHTML = `<div class="progress-header"><span class="progress-file">Loading Python runtime...</span><span class="spinner"></span></div><div class="progress-step">Downloading Pyodide (~10 MB). This only happens once.</div>`;
+    document.getElementById('progressItems').appendChild(loadingMsg);
+
+    await new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js';
+      script.onload = resolve;
+      script.onerror = () => reject(new Error('Failed to load Pyodide. Check your internet connection.'));
+      document.head.appendChild(script);
+    });
+
+    document.getElementById('pyodide-load-msg')?.remove();
   }
 
   for (const entry of readyFiles) {
@@ -1270,7 +1278,7 @@ async function runProcessing() {
       renderDownloadItem(entry, result.fullEXR, result.smallEXR, result.fullW, result.fullH);
       prog.update(100, '✓ Complete');
     } catch(e) {
-      prog.update(0, '✗ Error: ' + e.message);
+      prog.update(0, '✗ Error: ' + (e.message || String(e)).split('\n').slice(-2).join(' '));
       console.error(e);
     }
   }
